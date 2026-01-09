@@ -18,11 +18,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # CONFIG (ANPASSEN)
 # =====================================================
 BASE_DIR = Path("/Users/anoukwieczorek/Documents/Geographie/Projektseminar/Projekt/Landsat_Input")
-
-# Modell neben dem Skript (empfohlen)
 MODEL_PATH = SCRIPT_DIR / "gletscher_unet_best.pth"
 
-TIF_PATTERN = "*.TIF"          # ggf. enger: "*stack_mosaic*.TIF"
+TIF_PATTERN = "*.TIF"
 OUT_DIR = SCRIPT_DIR / "outputs_glacier_change"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -31,15 +29,16 @@ TILE = 128
 STRIDE = 128
 THRESH = 0.5
 
-# RGB-Band-Indizes (0-indexed) -> Rasterio indexes sind +1
 RGB_IDXS = (3, 2, 1)
-
-# Quicklook max Kante
 DISPLAY_MAX_EDGE = 1800
 
-# Overlay-Parameter
-LOSS_COLOR = (1.0, 0.0, 0.0)   # Rot für Rückgang
+LOSS_COLOR = (1.0, 0.0, 0.0)
 LOSS_ALPHA = 0.55
+
+# GeoTIFF Outputs
+WRITE_PROB_TIF = True   # prob_<year>.tif schreiben (float32)
+WRITE_MASK_TIF = True   # mask_<year>.tif schreiben (uint8 0/1)
+WRITE_LOSS_TIF = True   # loss_<old>_<new>.tif schreiben (uint8 0/1)
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print("Device:", device)
@@ -122,8 +121,34 @@ def downsample_mask(mask: np.ndarray, step: int):
     return mask[::step, ::step]
 
 
-def infer_glacier_mask(tif_path: Path):
-    """Gibt binäre Maske (H,W), Fläche (km²), CRS/Transform zurück."""
+def write_singleband_geotiff(out_path: Path, arr2d: np.ndarray, ref_src: rasterio.DatasetReader,
+                             dtype=None, nodata=None, compress="deflate"):
+    """
+    Schreibt ein 2D-Array als georeferenziertes GeoTIFF mit CRS/Transform/Shape aus ref_src.
+    """
+    if dtype is None:
+        dtype = arr2d.dtype
+
+    profile = ref_src.profile.copy()
+    profile.update(
+        driver="GTiff",
+        count=1,
+        dtype=dtype,
+        compress=compress,
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        nodata=nodata
+    )
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(arr2d.astype(dtype), 1)
+
+
+def infer_glacier_mask_and_prob(tif_path: Path):
+    """
+    Gibt mask (bool), prob (float32, 0..1, nan außerhalb), area_km2, crs, transform zurück.
+    """
     with rasterio.open(tif_path) as src:
         if src.count != IN_CHANNELS:
             raise ValueError(f"Erwartet {IN_CHANNELS} Bänder, aber Datei hat {src.count}: {tif_path}")
@@ -158,13 +183,18 @@ def infer_glacier_mask(tif_path: Path):
 
         mask = (prob_big >= THRESH) & covered
 
-        # Fläche
         px_w = float(transform.a)
         px_h = float(transform.e)
-        pixel_area = abs(px_w * px_h)  # bei UTM: m²
+        pixel_area = abs(px_w * px_h)
         area_km2 = (float(mask.sum()) * pixel_area) / 1e6
 
-        return mask, area_km2, crs, transform
+        if crs is not None and crs.is_geographic:
+            print(f"WARNUNG: CRS ist geografisch (Grad). Fläche in km² ist so nicht korrekt. "
+                  f"Reprojiziere in metrisches CRS (z.B. UTM).")
+
+        # Wir müssen ref_src fürs Schreiben draußen erneut öffnen oder hier pflegen.
+        # Darum geben wir nur arrays zurück; schreiben erfolgt später mit einem erneut geöffneten src.
+        return mask, prob_big, area_km2, crs, transform
 
 
 def main():
@@ -191,10 +221,10 @@ def main():
     print("Neu:", tif_new)
 
     # Inferenz beider Jahre
-    mask_old, area_old_km2, crs_old, transform_old = infer_glacier_mask(tif_old)
-    mask_new, area_new_km2, crs_new, transform_new = infer_glacier_mask(tif_new)
+    mask_old, prob_old, area_old_km2, crs_old, transform_old = infer_glacier_mask_and_prob(tif_old)
+    mask_new, prob_new, area_new_km2, crs_new, transform_new = infer_glacier_mask_and_prob(tif_new)
 
-    # Minimaler Konsistenzcheck
+    # Konsistenzcheck
     if mask_old.shape != mask_new.shape:
         raise RuntimeError(
             "Die Raster haben unterschiedliche Ausdehnung/Shape. "
@@ -202,25 +232,65 @@ def main():
             "(gleiches Mosaik-Extent, gleiche Auflösung/Transform)."
         )
 
-    # Change: Rückgang (Loss) = alt & ~neu
+    # Change: Rückgang
     loss = mask_old & (~mask_new)
     loss_px = int(loss.sum())
 
-    # Flächenverlust in km² (über Transform des 'neu' – identisch angenommen)
     px_w = float(transform_new.a)
     px_h = float(transform_new.e)
-    pixel_area = abs(px_w * px_h)  # m² (bei UTM)
+    pixel_area = abs(px_w * px_h)
     loss_km2 = (loss_px * pixel_area) / 1e6
 
     if crs_new is not None and crs_new.is_geographic:
         print("WARNUNG: CRS ist geografisch (Grad). km² ist so nicht korrekt. Reprojiziere in metrisches CRS (z.B. UTM).")
 
-    # RGB als Hintergrund: i. d. R. jüngstes Jahr ist anschaulicher
+    # -----------------------
+    # GeoTIFF Outputs schreiben
+    # -----------------------
+    # Wir nutzen die Profile/Georeferenz vom jeweiligen Eingabetif beim Schreiben.
+    if WRITE_MASK_TIF or WRITE_PROB_TIF:
+        with rasterio.open(tif_old) as src_old:
+            if WRITE_MASK_TIF:
+                out_mask_old = OUT_DIR / f"mask_{year_old}.tif"
+                write_singleband_geotiff(out_mask_old, mask_old.astype(np.uint8), src_old, dtype=np.uint8, nodata=0)
+                print("Saved:", out_mask_old)
+
+            if WRITE_PROB_TIF:
+                out_prob_old = OUT_DIR / f"prob_{year_old}.tif"
+                nodata_val = -9999.0
+                prob_out = prob_old.copy()
+                prob_out[np.isnan(prob_out)] = nodata_val
+                write_singleband_geotiff(out_prob_old, prob_out.astype(np.float32), src_old, dtype=np.float32, nodata=nodata_val)
+                print("Saved:", out_prob_old)
+
+        with rasterio.open(tif_new) as src_new:
+            if WRITE_MASK_TIF:
+                out_mask_new = OUT_DIR / f"mask_{year_new}.tif"
+                write_singleband_geotiff(out_mask_new, mask_new.astype(np.uint8), src_new, dtype=np.uint8, nodata=0)
+                print("Saved:", out_mask_new)
+
+            if WRITE_PROB_TIF:
+                out_prob_new = OUT_DIR / f"prob_{year_new}.tif"
+                nodata_val = -9999.0
+                prob_out = prob_new.copy()
+                prob_out[np.isnan(prob_out)] = nodata_val
+                write_singleband_geotiff(out_prob_new, prob_out.astype(np.float32), src_new, dtype=np.float32, nodata=nodata_val)
+                print("Saved:", out_prob_new)
+
+    if WRITE_LOSS_TIF:
+        # Loss hat dasselbe Grid wie die Eingaben; wir schreiben es mit Profil von "new"
+        with rasterio.open(tif_new) as src_new:
+            out_loss = OUT_DIR / f"loss_{year_old}_{year_new}.tif"
+            write_singleband_geotiff(out_loss, loss.astype(np.uint8), src_new, dtype=np.uint8, nodata=0)
+            print("Saved:", out_loss)
+
+    # -----------------------
+    # PNG Quicklook
+    # -----------------------
     with rasterio.open(tif_new) as src_new:
         rgb_img, step = read_rgb_quicklook(src_new, RGB_IDXS, DISPLAY_MAX_EDGE)
     loss_disp = downsample_mask(loss.astype(np.uint8), step)
 
-    # Figure
     fig = plt.figure(figsize=(12, 6))
 
     ax1 = plt.subplot(1, 2, 1)
@@ -256,8 +326,25 @@ def main():
     out_csv = OUT_DIR / f"glacier_change_{year_old}_{year_new}.csv"
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["year_old", "year_new", "area_old_km2", "area_new_km2", "loss_km2", "output_png"])
-        w.writerow([year_old, year_new, f"{area_old_km2:.6f}", f"{area_new_km2:.6f}", f"{loss_km2:.6f}", str(out_png)])
+        w.writerow([
+            "year_old", "year_new",
+            "area_old_km2", "area_new_km2", "loss_km2",
+            "png",
+            "mask_old_tif", "mask_new_tif",
+            "loss_tif",
+            "prob_old_tif", "prob_new_tif"
+        ])
+
+        w.writerow([
+            year_old, year_new,
+            f"{area_old_km2:.6f}", f"{area_new_km2:.6f}", f"{loss_km2:.6f}",
+            str(out_png),
+            str(OUT_DIR / f"mask_{year_old}.tif") if WRITE_MASK_TIF else "",
+            str(OUT_DIR / f"mask_{year_new}.tif") if WRITE_MASK_TIF else "",
+            str(OUT_DIR / f"loss_{year_old}_{year_new}.tif") if WRITE_LOSS_TIF else "",
+            str(OUT_DIR / f"prob_{year_old}.tif") if WRITE_PROB_TIF else "",
+            str(OUT_DIR / f"prob_{year_new}.tif") if WRITE_PROB_TIF else ""
+        ])
 
     print("\nSaved:", out_png)
     print("Saved:", out_csv)
