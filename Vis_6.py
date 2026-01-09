@@ -15,8 +15,6 @@ import csv
 BASE_DIR = "/Users/anoukwieczorek/Documents/Geographie/Projektseminar/Projekt/Landsat_Input"
 MODEL_PATH = "gletscher_unet_best.pth"
 
-# Falls du wirklich NUR mosaics mit bestimmtem Namen hast, nutze PATTERN enger.
-# Ansonsten: "*.TIF" oder "*.tif"
 TIF_PATTERN = "*.TIF"
 
 OUT_DIR = os.path.join(BASE_DIR, "_outputs_glacier")
@@ -24,18 +22,18 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 IN_CHANNELS = 10
 TILE = 128
-STRIDE = 128          # 128 = keine Überlappung; 64 = Überlappung (glatter, langsamer)
+STRIDE = 128
 THRESH = 0.5
 
-# RGB-Band-Indizes (0-indexed)
 RGB_IDXS = (3, 2, 1)
-
-# Quicklook-Größe (längste Kante in Pixeln)
 DISPLAY_MAX_EDGE = 1600
+
+# GeoTIFF Output toggles
+WRITE_PROB_TIF = True   # zusätzlich prob_<year>.tif schreiben (float32, 0..1)
+WRITE_MASK_TIF = True   # mask_<year>.tif schreiben (uint8, 0/1)
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print("Device:", device)
-
 
 # -----------------------
 # MODEL LADEN (einmal)
@@ -57,10 +55,7 @@ def normalize_like_training(x: np.ndarray) -> np.ndarray:
 
 
 def compute_positions(length: int, tile: int, stride: int):
-    """
-    Liefert Startpositionen so, dass der letzte Tile den Rand abdeckt.
-    Funktioniert auch, wenn length < tile.
-    """
+    """Startpositionen so, dass der letzte Tile den Rand abdeckt."""
     if length <= tile:
         return [0]
     last = length - tile
@@ -71,9 +66,7 @@ def compute_positions(length: int, tile: int, stride: int):
 
 
 def read_rgb_quicklook(src: rasterio.DatasetReader, rgb_idxs, max_edge: int):
-    """
-    Liest RGB als downsampled Quicklook direkt aus Rasterio (RAM-schonend).
-    """
+    """Liest RGB als downsampled Quicklook direkt aus Rasterio (RAM-schonend)."""
     h, w = src.height, src.width
     step = int(np.ceil(max(h, w) / max_edge))
     step = max(step, 1)
@@ -81,19 +74,16 @@ def read_rgb_quicklook(src: rasterio.DatasetReader, rgb_idxs, max_edge: int):
     out_h = int(np.ceil(h / step))
     out_w = int(np.ceil(w / step))
 
-    # Rasterio ist 1-indexed bei Band-Indexes
     band_indexes = [rgb_idxs[0] + 1, rgb_idxs[1] + 1, rgb_idxs[2] + 1]
-
     rgb = src.read(
         indexes=band_indexes,
         out_shape=(3, out_h, out_w),
         resampling=Resampling.bilinear
     ).astype(np.float32)
 
-    rgb = normalize_like_training(rgb)  # gleiche Normalisierung wie Training
+    rgb = normalize_like_training(rgb)
     rgb_img = np.stack([rgb[0], rgb[1], rgb[2]], axis=-1)
 
-    # Kontraststretch wie bei dir
     lo = np.percentile(rgb_img, 2)
     hi = np.percentile(rgb_img, 98)
     rgb_img = np.clip((rgb_img - lo) / (hi - lo + 1e-6), 0, 1)
@@ -102,18 +92,14 @@ def read_rgb_quicklook(src: rasterio.DatasetReader, rgb_idxs, max_edge: int):
 
 
 def downsample_mask(mask: np.ndarray, step: int):
-    """
-    Maske (H,W) auf Quicklook-Größe bringen, indem jedes step-te Pixel genommen wird.
-    """
+    """Maske (H,W) auf Quicklook-Größe bringen."""
     if step <= 1:
         return mask
     return mask[::step, ::step]
 
 
 def find_year_folders(base_dir: str):
-    """
-    Findet Unterordner, die wie Jahre aussehen (z.B. '2013', '2014', ...).
-    """
+    """Findet Unterordner, die wie Jahre aussehen (z.B. '2013', '2014', ...)."""
     years = []
     for name in os.listdir(base_dir):
         p = os.path.join(base_dir, name)
@@ -123,22 +109,39 @@ def find_year_folders(base_dir: str):
 
 
 def find_tif_for_year(year_dir: str, pattern: str):
-    """
-    Sucht eine passende TIF im Jahresordner. Nimmt die erste, falls mehrere gefunden werden.
-    Du kannst hier auch Logik einbauen (z.B. 'stack_mosaic' bevorzugen).
-    """
+    """Sucht eine passende TIF im Jahresordner."""
     candidates = glob.glob(os.path.join(year_dir, pattern))
     if not candidates:
-        # auch lowercase versuchen
         candidates = glob.glob(os.path.join(year_dir, pattern.lower()))
     if not candidates:
         return None
 
-    # Optional: bevorzugt Dateien mit 'mosaic' oder 'stack'
     preferred = [c for c in candidates if ("mosaic" in os.path.basename(c).lower() or "stack" in os.path.basename(c).lower())]
-    if preferred:
-        return sorted(preferred)[0]
-    return sorted(candidates)[0]
+    return sorted(preferred)[0] if preferred else sorted(candidates)[0]
+
+
+def write_singleband_geotiff(out_path: str, arr2d: np.ndarray, ref_src: rasterio.DatasetReader,
+                             dtype=None, nodata=None, compress="deflate"):
+    """
+    Schreibt ein 2D-Array als georeferenziertes GeoTIFF mit CRS/Transform aus ref_src.
+    """
+    if dtype is None:
+        dtype = arr2d.dtype
+
+    profile = ref_src.profile.copy()
+    profile.update(
+        driver="GTiff",
+        count=1,
+        dtype=dtype,
+        compress=compress,
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        nodata=nodata
+    )
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(arr2d.astype(dtype), 1)
 
 
 def process_one_year(year: int, tif_path: str):
@@ -165,10 +168,10 @@ def process_one_year(year: int, tif_path: str):
             for top in tops:
                 for left in lefts:
                     win = Window(left, top, TILE, TILE)
-                    patch = src.read(window=win).astype(np.float32)  # (bands, TILE, TILE)
+                    patch = src.read(window=win).astype(np.float32)
 
                     patch = normalize_like_training(patch)
-                    inp = torch.from_numpy(patch).unsqueeze(0).to(device)  # (1,10,128,128)
+                    inp = torch.from_numpy(patch).unsqueeze(0).to(device)
 
                     logits = model(inp)
                     prob = torch.sigmoid(logits)[0, 0].detach().cpu().numpy().astype(np.float32)
@@ -187,7 +190,7 @@ def process_one_year(year: int, tif_path: str):
         # -----------------------
         px_w = float(transform.a)
         px_h = float(transform.e)
-        pixel_area = abs(px_w * px_h)  # bei UTM: m²
+        pixel_area = abs(px_w * px_h)
 
         glacier_area_m2 = float(pred_big.sum()) * pixel_area
         glacier_area_km2 = glacier_area_m2 / 1e6
@@ -202,8 +205,27 @@ def process_one_year(year: int, tif_path: str):
         rgb_img, step = read_rgb_quicklook(src, RGB_IDXS, DISPLAY_MAX_EDGE)
         pred_disp = downsample_mask(pred_big.astype(np.uint8), step)
 
+        # -----------------------
+        # GeoTIFFs speichern (zusätzlich zu PNG)
+        # -----------------------
+        out_mask_tif = None
+        out_prob_tif = None
+
+        if WRITE_MASK_TIF:
+            out_mask_tif = os.path.join(OUT_DIR, f"mask_{year}.tif")
+            mask_u8 = pred_big.astype(np.uint8)  # 0/1
+            write_singleband_geotiff(out_mask_tif, mask_u8, src, dtype=np.uint8, nodata=0)
+
+        if WRITE_PROB_TIF:
+            out_prob_tif = os.path.join(OUT_DIR, f"prob_{year}.tif")
+            # NaNs auf nodata setzen
+            prob_out = prob_big.copy()
+            nodata_val = -9999.0
+            prob_out[~covered] = nodata_val
+            write_singleband_geotiff(out_prob_tif, prob_out, src, dtype=np.float32, nodata=nodata_val)
+
     # -----------------------
-    # FIGURE SPEICHERN
+    # FIGURE SPEICHERN (PNG)
     # -----------------------
     fig = plt.figure(figsize=(12, 6))
 
@@ -233,9 +255,13 @@ def process_one_year(year: int, tif_path: str):
     plt.close(fig)
 
     print(f"[{year}] Saved figure: {out_png}")
+    if out_mask_tif:
+        print(f"[{year}] Saved mask GeoTIFF: {out_mask_tif}")
+    if out_prob_tif:
+        print(f"[{year}] Saved prob GeoTIFF: {out_prob_tif}")
     print(f"[{year}] Glacier area: {glacier_area_km2:.4f} km²")
 
-    return glacier_area_km2, out_png
+    return glacier_area_km2, out_png, out_mask_tif, out_prob_tif
 
 
 def main():
@@ -243,7 +269,7 @@ def main():
     if not years:
         raise RuntimeError(f"Keine Jahresordner in {BASE_DIR} gefunden (erwartet Ordnernamen wie '2013', '2014', ...).")
 
-    results = []  # (year, area_km2, png_path)
+    results = []  # (year, area_km2, png_path, mask_tif, prob_tif)
 
     for year in years:
         year_dir = os.path.join(BASE_DIR, str(year))
@@ -253,8 +279,8 @@ def main():
             print(f"[{year}] Keine TIF gefunden in {year_dir} mit Pattern '{TIF_PATTERN}'. Überspringe.")
             continue
 
-        area_km2, png_path = process_one_year(year, tif_path)
-        results.append((year, area_km2, png_path))
+        area_km2, png_path, mask_tif, prob_tif = process_one_year(year, tif_path)
+        results.append((year, area_km2, png_path, mask_tif, prob_tif))
 
     if not results:
         raise RuntimeError("Es wurden keine Jahre verarbeitet (keine passenden TIFs gefunden).")
@@ -265,14 +291,14 @@ def main():
     csv_path = os.path.join(OUT_DIR, "glacier_areas.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["year", "glacier_area_km2", "preview_png"])
-        for year, area, png in results:
-            w.writerow([year, f"{area:.6f}", png])
+        w.writerow(["year", "glacier_area_km2", "preview_png", "mask_tif", "prob_tif"])
+        for year, area, png, mask_tif, prob_tif in results:
+            w.writerow([year, f"{area:.6f}", png, mask_tif or "", prob_tif or ""])
 
     print("\nSaved CSV:", csv_path)
 
     # -----------------------
-    # OPTIONAL: Zeitreihe plotten
+    # Zeitreihe plotten
     # -----------------------
     years_sorted = [r[0] for r in results]
     areas_sorted = [r[1] for r in results]
@@ -293,4 +319,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
