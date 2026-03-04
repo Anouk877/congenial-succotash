@@ -10,7 +10,7 @@ import segmentation_models_pytorch as smp
 
 
 BATCH_SIZE = 32
-EPOCHS = 50
+EPOCHS = 60
 LEARNING_RATE = 1e-4
 VAL_RATIO = 0.2
 SEED = 42
